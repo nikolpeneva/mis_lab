@@ -1,0 +1,2 @@
+permitrootlogin without-password
+passwordauthentication yes
