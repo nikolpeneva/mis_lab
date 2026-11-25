@@ -1,0 +1,71 @@
+#!/usr/sbin/nft -f
+# МИС, Час 9. Защитна стена на gw за RETAILBANK
+# Сегменти: hq 10.190.0.0/24, plovdiv 10.191.0.0/24, vidin 10.192.0.0/24, inet 203.0.113.0/24
+# Хостове: cbs 10.190.0.10 (8443), atm-manager 10.190.0.20 (9000),
+#          терминали 10.191.0.20 / 10.192.0.20, банкомати 10.191.0.50 / 10.192.0.50
+# Ред на работа: матрица на потоците -> правило с коментар "изискване N" -> proba разрешено и забранено -> zhurnal.
+# Прилагане: sudo ./postroi-segmenti.sh probvai moi.nft   (връща старото след 60 s без потвърждение)
+
+flush ruleset
+
+define MGMT = "wan"          # интерфейсът за управление на gw по SSH (свери със: skelet)
+define IF_HQ       = "v-hq"
+define IF_PLOVDIV  = "v-plovdiv"
+define IF_VIDIN    = "v-vidin"
+define IF_INET     = "v-inet"
+define NET_HQ      = 10.190.0.0/24
+define NET_PLOVDIV = 10.191.0.0/24
+define NET_VIDIN   = 10.192.0.0/24
+define NET_INET    = 203.0.113.0/24
+
+table inet firma {
+    chain input {
+        # трафик КЪМ самия gw
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        ct state invalid drop
+        iifname "lo" accept
+        iifname $MGMT tcp dport 22 accept comment "управление на gw по SSH"
+        counter log prefix "[RETAILBANK-IN-DROP] "
+    }
+
+    chain forward {
+        # трафик ПРЕЗ gw, между сегментите: тук е сегментацията
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+        ct state invalid drop
+
+        # изискване 1: банковите терминали (само те, не банкоматите) към CBS на 8443
+        ip saddr { 10.191.0.20, 10.192.0.20 } ip daddr 10.190.0.10 tcp dport 8443 accept \
+            comment "изискване 1: банковите терминали към CBS (8443)"
+
+        # изискване 2: банкоматите само към ATM Manager на 9000
+        ip saddr { 10.191.0.50, 10.192.0.50 } ip daddr 10.190.0.20 tcp dport 9000 accept \
+            comment "изискване 2: банкоматите само към ATM Manager (9000)"
+
+        # изискване 3 + 5: банкоматите нямат друг достъп (вкл. CBS); всеки отказ от банкомат се логва
+        ip saddr { 10.191.0.50, 10.192.0.50 } counter log prefix "[BANK-ATM-DROP] " drop \
+            comment "изискване 3+5: ATM само до ATM Manager; останалото лог+drop"
+
+        # изискване 4: HQ към интернет (NAT masquerade е в postrouting)
+        iifname $IF_HQ oifname $IF_INET ip saddr $NET_HQ accept \
+            comment "изискване 4: интернет само за HQ"
+
+        counter log prefix "[RETAILBANK-DROP] "
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        # изискване 4: само HQ излиза към интернет с адреса на gw
+        oifname $IF_INET ip saddr $NET_HQ masquerade comment "изискване 4: NAT (masquerade) само за HQ"
+    }
+}
